@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Screenpipe Dashboard</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1b; --muted: #77776f;
+    --line: #e2e2dc; --tick: #b9b9b0; --hit: #2f6fde; --cur: #e0452b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #1f1f1d; --text: #ececE5; --muted: #8f8f86;
+      --line: #2e2e2b; --tick: #4a4a45; --hit: #5b93f5; --cur: #ff6a4d;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: grid; grid-template-columns: 280px 1fr; grid-template-rows: 1fr auto;
+    grid-template-areas: "side main" "side time";
+  }
+  aside {
+    grid-area: side; background: var(--panel); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  form { padding: 14px; display: grid; gap: 8px; border-bottom: 1px solid var(--line); }
+  select, input, button {
+    font: inherit; color: inherit; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; width: 100%;
+  }
+  button { cursor: pointer; background: var(--hit); color: #fff; border-color: var(--hit); }
+  button.secondary { background: transparent; color: var(--text); border-color: var(--line); }
+  .row { display: flex; gap: 6px; }
+  #status { color: var(--muted); font-size: 12px; padding: 8px 14px; }
+  #results { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+  #results li {
+    padding: 6px 14px; cursor: pointer; border-bottom: 1px solid var(--line);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #results li:hover, #results li.active { background: var(--bg); }
+  #results time { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 6px; }
+  main {
+    grid-area: main; min-height: 0; padding: 14px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  }
+  #frame {
+    max-width: 100%; max-height: calc(100% - 40px); object-fit: contain;
+    border: 1px solid var(--line); border-radius: 6px; background: var(--panel);
+  }
+  #caption {
+    color: var(--muted); font-size: 13px; text-align: center; max-width: 100%;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #caption b { color: var(--text); font-weight: 600; }
+  footer { grid-area: time; padding: 8px 14px 12px; border-top: 1px solid var(--line); background: var(--panel); }
+  #timeline { width: 100%; height: 44px; display: block; cursor: pointer; }
+  .hours { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
+  @media (max-width: 700px) {
+    body { grid-template-columns: 1fr; grid-template-rows: auto 1fr auto; grid-template-areas: "side" "main" "time"; }
+    aside { max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<aside>
+  <form id="form">
+    <select id="field">
+      <option value="q">Texto (search)</option>
+      <option value="app_name">App (app_name, nome exato)</option>
+      <option value="window_name">Janela (window_name)</option>
+      <option value="browser_url">URL (browser_url)</option>
+    </select>
+    <input id="term" placeholder="O que procurar…" autocomplete="off">
+    <input id="day" type="date">
+    <div class="row">
+      <button type="submit">Buscar</button>
+      <button type="button" class="secondary" id="clear">Limpar</button>
+    </div>
+  </form>
+  <div id="status"></div>
+  <ul id="results"></ul>
+</aside>
+
+<main>
+  <img id="frame" alt="">
+  <div id="caption">Sem capturas</div>
+</main>
+
+<footer>
+  <canvas id="timeline"></canvas>
+  <div class="hours"><span>00h</span><span>06h</span><span>12h</span><span>18h</span><span>24h</span></div>
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { all: [], hits: [], current: null, dayStart: 0 };
+const DAY_MS = 86400000;
+
+const fmtTime = (ms) => new Date(ms).toLocaleTimeString("pt-PT", { hour12: false });
+const isoDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+// Fetch every frame matching the filter for the selected day, deduplicated by frame_id.
+async function fetchFrames(filter) {
+  const start = new Date(state.dayStart), end = new Date(state.dayStart + DAY_MS);
+  const seen = new Map();
+  for (let offset = 0; ; offset += 1000) {
+    const p = new URLSearchParams({
+      content_type: "ocr", limit: 1000, offset,
+      start_time: start.toISOString(), end_time: end.toISOString(), ...filter,
+    });
+    const res = await fetch(`/api/search?${p}`);
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    const { data = [] } = await res.json();
+    for (const { content: c } of data) {
+      if (c.frame_id == null || seen.has(c.frame_id)) continue;
+      seen.set(c.frame_id, {
+        id: c.frame_id, t: Date.parse(c.timestamp),
+        app: c.app_name || "", win: c.window_name || "", url: c.browser_url || "",
+      });
+    }
+    if (data.length < 1000) break;
+  }
+  return [...seen.values()].sort((a, b) => a.t - b.t);
+}
+
+async function loadDay() {
+  state.dayStart = new Date(`${$("day").value}T00:00:00`).getTime();
+  $("status").textContent = "A carregar…";
+  try {
+    state.all = await fetchFrames({});
+    state.hits = [];
+    renderResults(state.all, `${state.all.length} capturas neste dia`);
+    show(state.all[state.all.length - 1]);
+  } catch (e) {
+    $("status").textContent = `Erro: ${e.message}`;
+  }
+}
+
+async function search(ev) {
+  ev.preventDefault();
+  const term = $("term").value.trim();
+  if (!term) return loadDay();
+  $("status").textContent = "A procurar…";
+  try {
+    state.hits = await fetchFrames({ [$("field").value]: term });
+    renderResults(state.hits, `${state.hits.length} resultados para “${term}”`);
+    if (state.hits.length) show(state.hits[0]);
+    drawTimeline();
+  } catch (e) {
+    $("status").textContent = `Erro: ${e.message}`;
+  }
+}
+
+function renderResults(list, label) {
+  $("status").textContent = label;
+  const ul = $("results");
+  ul.replaceChildren(...list.map((f) => {
+    const li = document.createElement("li");
+    li.dataset.id = f.id;
+    const time = document.createElement("time");
+    time.textContent = fmtTime(f.t);
+    li.append(time, `${f.app}${f.win ? " · " + f.win : ""}`);
+    li.title = f.url || f.win;
+    li.onclick = () => show(f);
+    return li;
+  }));
+}
+
+function show(f) {
+  if (!f) {
+    $("frame").removeAttribute("src");
+    $("caption").textContent = "Sem capturas";
+    state.current = null;
+    return drawTimeline();
+  }
+  state.current = f;
+  $("frame").src = `/api/frames/${f.id}`;
+  $("caption").innerHTML = "";
+  const b = document.createElement("b");
+  b.textContent = fmtTime(f.t);
+  $("caption").append(b, `  ${f.app}${f.win ? " · " + f.win : ""}${f.url ? " · " + f.url : ""}`);
+  for (const li of $("results").children) li.classList.toggle("active", li.dataset.id == f.id);
+  $("results").querySelector(".active")?.scrollIntoView({ block: "nearest" });
+  drawTimeline();
+}
+
+function drawTimeline() {
+  const c = $("timeline"), dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  c.width = w * dpr; c.height = h * dpr;
+  const ctx = c.getContext("2d");
+  ctx.scale(dpr, dpr);
+  const css = getComputedStyle(document.documentElement);
+  const x = (t) => ((t - state.dayStart) / DAY_MS) * w;
+  const ticks = (list, color, top, height) => {
+    ctx.fillStyle = color;
+    for (const f of list) ctx.fillRect(Math.floor(x(f.t)), top, 1, height);
+  };
+  ctx.fillStyle = css.getPropertyValue("--line");
+  for (let hr = 0; hr <= 24; hr += 1) ctx.fillRect(Math.floor((hr / 24) * w), h - 4, 1, 4);
+  ticks(state.all, css.getPropertyValue("--tick"), 6, h - 14);
+  ticks(state.hits, css.getPropertyValue("--hit"), 0, h - 4);
+  if (state.current) {
+    ctx.fillStyle = css.getPropertyValue("--cur");
+    ctx.fillRect(Math.floor(x(state.current.t)) - 1, 0, 3, h);
+  }
+}
+
+// Nearest frame to a point in time, preferring search hits when there are any.
+function nearest(t) {
+  const list = state.hits.length ? state.hits : state.all;
+  let best = null;
+  for (const f of list) if (!best || Math.abs(f.t - t) < Math.abs(best.t - t)) best = f;
+  return best;
+}
+
+function step(dir) {
+  const list = state.hits.length ? state.hits : state.all;
+  const i = list.indexOf(state.current);
+  if (list[i + dir]) show(list[i + dir]);
+}
+
+$("timeline").addEventListener("click", (e) => {
+  const r = e.currentTarget.getBoundingClientRect();
+  show(nearest(state.dayStart + ((e.clientX - r.left) / r.width) * DAY_MS));
+});
+$("timeline").addEventListener("mousemove", (e) => {
+  const r = e.currentTarget.getBoundingClientRect();
+  e.currentTarget.title = fmtTime(state.dayStart + ((e.clientX - r.left) / r.width) * DAY_MS);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.target.matches("input, select")) return;
+  if (e.key === "ArrowLeft") step(-1);
+  if (e.key === "ArrowRight") step(1);
+});
+$("frame").addEventListener("error", () => {
+  if ($("frame").getAttribute("src")) $("caption").append(" · imagem indisponível");
+});
+$("form").addEventListener("submit", search);
+$("clear").addEventListener("click", () => { $("term").value = ""; loadDay(); });
+$("day").addEventListener("change", async () => {
+  await loadDay();
+  if ($("term").value.trim()) $("form").requestSubmit();
+});
+window.addEventListener("resize", drawTimeline);
+
+$("day").value = isoDay(new Date());
+loadDay();
+</script>
+</body>
+</html>
